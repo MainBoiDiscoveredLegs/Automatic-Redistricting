@@ -206,9 +206,65 @@ def initialise(gdf, n):
     # where track 0 is in d1, track 1 in d2 and so on
 
 # OPTIMISATION (blamk rn) =====
+def optimise(labels, gdf, adj, n):
+    labels = labels.copy()
+    population = gdf["population"].values
+    ideal = population.sum() / n
 
-def optimise(labels, gdf, adj, n): # gege add whatever you need here
-    # gege do stuff here :D
+    def is_contiguous(district_tracts):
+        if len(district_tracts) <= 1:
+            return True
+        subgraph = {t: adj[t] & district_tracts for t in district_tracts}
+        visited = set()
+        queue = [next(iter(district_tracts))]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(subgraph[node] - visited)
+        return visited == district_tracts
+
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(labels)):
+            current = labels[i]
+            current_tracts = set(np.where(labels == current)[0])
+            if len(current_tracts) <= 1:
+                continue
+            for neighbor in adj[i]:
+                target = labels[neighbor]
+                if target == current:
+                    continue
+                # check contiguity of donor district after removal
+                remaining = current_tracts - {i}
+                if not is_contiguous(remaining):
+                    continue
+                # check if swap improves population balance
+                current_pop = population[labels == current].sum()
+                target_pop = population[labels == target].sum()
+                before = (current_pop - ideal)**2 + (target_pop - ideal)**2
+                after = ((current_pop - population[i]) - ideal)**2 + ((target_pop + population[i]) - ideal)**2
+                if after < before:
+                    labels[i] = target
+                    improved = True
+                    break
+    return labels
+def fix_contiguity(labels, adj):
+    labels = labels.copy()
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(labels)):
+            current = labels[i]
+            current_tracts = set(np.where(labels == current)[0])
+            neighbors_same = {j for j in adj[i] if labels[j] == current}
+            if len(neighbors_same) == 0 and len(current_tracts) > 1:
+                neighbor_labels = [labels[j] for j in adj[i]]
+                if neighbor_labels:
+                    labels[i] = max(set(neighbor_labels), key=neighbor_labels.count)
+                    changed = True
     return labels
 
 # VISUALISATION :D (for now just the redistricted map) ======
@@ -227,21 +283,109 @@ def plot_state(state, gdf, labels, n):
         union = unary_union(gdf.geometry[labels == d])
         gpd.GeoSeries([union]).plot(ax=ax, facecolor="none", edgecolor="black", linewidth=1.2)
 
-    ax.set_title(f"{state}: {n} districts (unoptimised (rn))", fontsize=13, fontweight="bold")
+    ax.set_title(f"{state}: {n} districts (optimised)", fontsize=13, fontweight="bold")
     ax.axis("off")
     plt.tight_layout()
 
-    out = f"redistricting_output/{state.lower()}_unoptimised.png"
+    out = f"redistricting_output/{state.lower()}_optimised.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved as {out}")
-
-# you guys need to plot the figures here:
-
-
-
-
-
+    
+    #had some help from nyla on how gepandas work
+def plot_vote_share(state, gdf, labels, n):
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    #this is just the copy of the tract table to reuse it to plot this graph
+    gdf = gdf.copy()
+    gdf["label"] = labels
+    
+    # percentage votes by district for dems, and setting color map for rep=0
+    district_votes = gdf.groupby("label")[["dem_votes", "rep_votes"]].sum()
+    district_votes["dem_share"] = district_votes["dem_votes"] / (
+        district_votes["dem_votes"] + district_votes["rep_votes"]
+    )
+    
+    # colouring the district's dem share (blue = dem, red = rep)
+    gdf["dem_share"] = gdf["label"].map(district_votes["dem_share"])
+    gdf.plot(column="dem_share", cmap="RdBu", vmin=0, vmax=1,
+             ax=ax, linewidth=0.1, edgecolor="white", legend=True)
+    
+    # district outlines uggh
+    for d in range(n):
+        union = unary_union(gdf.geometry[labels == d])
+        gpd.GeoSeries([union]).plot(ax=ax, facecolor="none", edgecolor="white", linewidth=0.1)
+    
+    ax.set_title(f"{state}: District vote share (Blue=Dem, Red=Rep)", fontsize=13, fontweight="bold")
+    ax.axis("off")
+    plt.tight_layout()
+    
+    out = f"redistricting_output/{state.lower()}_voteshare.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved as {out}")
+    
+def plot_seat_comparison(state, gdf, labels, n):
+    #again 
+    gdf = gdf.copy()  
+    gdf["label"] = labels
+    
+    #how many dems won and reps
+    district_votes = gdf.groupby("label")[["dem_votes", "rep_votes"]].sum()
+    redistricted_dem = (district_votes["dem_votes"] > district_votes["rep_votes"]).sum() 
+    redistricted_rep = n - redistricted_dem
+    
+    #2020 results 
+    actual = {
+        "Alabama":       {"D": 1, "R": 6},
+        "Massachusetts": {"D": 9, "R": 0},
+        "Michigan":      {"D": 7, "R": 6},
+    }
+    actual_dem = actual[state]["D"]
+    actual_rep = actual[state]["R"]
+    
+    fig, ax = plt.subplots(figsize=(6, 5))
+    x = np.arange(2)
+    width = 0.35
+    #bar as comparison
+    ax.bar(x[0] - width/2, actual_dem,       width, label="Actual 2020 (D)",       color="blue", alpha=0.5)
+    ax.bar(x[1] - width/2, actual_rep,       width, label="Actual 2020 (R)",       color="red",  alpha=0.5)
+    ax.bar(x[0] + width/2, redistricted_dem, width, label="Redistricted (D)", color="blue", alpha=1.0)
+    ax.bar(x[1] + width/2, redistricted_rep, width, label="Redistricted (R)", color="red",  alpha=1.0)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(["Democrat seats", "Republican seats"])
+    ax.set_ylabel("Number of seats")
+    ax.set_title(f"{state}: Actual vs Redistricted seats", fontsize=13, fontweight="bold")
+    ax.legend()
+    plt.tight_layout()
+    
+    out = f"redistricting_output/{state.lower()}_seat_comparison.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved as {out}")
+    
+def plot_population_balance(state, gdf, labels, n):
+    gdf = gdf.copy()
+    gdf["label"] = labels
+    
+    district_pop = gdf.groupby("label")["population"].sum()
+    ideal = district_pop.sum() / n  # this is what every district should have
+    
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(range(n), district_pop.values, color="steelblue", edgecolor="white")
+    ax.axhline(ideal, color="red", linestyle="--", linewidth=1.5, label=f"Ideal ({ideal:,.0f})")
+    
+    ax.set_xlabel("District")
+    ax.set_ylabel("Population (Millions)")
+    ax.set_title(f"{state}: Population per district", fontsize=13, fontweight="bold")
+    ax.legend()
+    plt.tight_layout()
+    
+    out = f"redistricting_output/{state.lower()}_population_balance.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved as {out}")
 
 # ======
 # (you guys can pretty much ignore this,, it just runs everything for each state in the config)
@@ -254,6 +398,11 @@ if __name__ == "__main__":
         gdf, adj = running(state, cfg)
         labels = initialise(gdf, n)
         labels = optimise(labels, gdf, adj, n)
+        labels = fix_contiguity(labels, adj)
         plot_state(state, gdf, labels, n) # so like, after the optimisation fn is filled in the plots i made will reflect it :D
+        plot_vote_share(state, gdf, labels, n)
+        plot_seat_comparison(state, gdf, labels, n)
+        plot_population_balance(state, gdf, labels, n)
+        
 
-        print(f"[{state}] Done.")
+        print(f"{state} Done.")
