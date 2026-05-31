@@ -257,22 +257,11 @@ def fix_all_contiguity(labels, adj, n):
                 break
     return labels
 
-# ── WEIGHT OPTIMISATION ───────────────────────────────────────────────────────
 
 def score_labels(labels, gdf, adj, n):
-    """
-    Scores a labelling on both objectives. Lower is better for both.
-    
-    compactness_score = average distance of each tract from its district's centroid
-                        (lower = more blob-like districts)
-    
-    balance_score     = coefficient of variation of district populations
-                        (lower = more equal populations, 0 = perfect)
-    """
     population = gdf["population"].values
     centroids  = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
 
-    # compactness: mean distance to district centroid
     total_dist = 0.0
     for d in range(n):
         members = np.where(labels == d)[0]
@@ -281,23 +270,15 @@ def score_labels(labels, gdf, adj, n):
         w = population[members]
         centre = np.average(centroids[members], axis=0, weights=w)
         total_dist += np.sum(np.linalg.norm(centroids[members] - centre, axis=1))
-    compactness_score = total_dist / len(labels)   # avg metres from centre
+    compactness_score = total_dist / len(labels)
 
-    # balance: coefficient of variation of district populations (std/mean)
     district_pops = np.array([population[labels == d].sum() for d in range(n)])
-    balance_score = district_pops.std() / district_pops.mean()  # 0 = perfect
+    balance_score = district_pops.std() / district_pops.mean()
 
     return compactness_score, balance_score
 
 
 def find_optimal_weights(gdf, adj, n, labels_init):
-    """
-    Grid searches over (COMPACT_WEIGHT, BALANCE_WEIGHT) pairs and returns
-    the best combo — defined as the one with the lowest combined normalised score.
-    
-    We try a coarse grid first (fast), then zoom into the best region (fine).
-    """
-    # coarse grid — 9 combinations
     coarse_grid = [
         (cw, bw)
         for cw in [1.0, 3.0, 5.0]
@@ -312,14 +293,12 @@ def find_optimal_weights(gdf, adj, n, labels_init):
         coarse_results.append((cw, bw, cs, bs, lbl))
         print(f"      CW={cw:.1f} BW={bw:.1f}  →  compactness={cs:,.0f}m  balance={bs:.4f}")
 
-    # normalise both scores to [0,1] so they're comparable
     all_cs = [r[2] for r in coarse_results]
     all_bs = [r[3] for r in coarse_results]
     cs_min, cs_max = min(all_cs), max(all_cs)
     bs_min, bs_max = min(all_bs), max(all_bs)
 
     def combined(cs, bs):
-        # equal weight between the two objectives when picking the winner
         norm_cs = (cs - cs_min) / (cs_max - cs_min + 1e-9)
         norm_bs = (bs - bs_min) / (bs_max - bs_min + 1e-9)
         return norm_cs + norm_bs
@@ -328,25 +307,23 @@ def find_optimal_weights(gdf, adj, n, labels_init):
     best_cw, best_bw = coarse_results[0][0], coarse_results[0][1]
     print(f"    Best coarse: CW={best_cw} BW={best_bw}")
 
-    # fine grid — zoom in around the best coarse point
     step = 1.0
     fine_grid = [
         (max(0.5, best_cw + dcw), max(0.5, best_bw + dbw))
         for dcw in [-step, 0, step]
         for dbw in [-step, 0, step]
-        if (dcw, dbw) != (0, 0)   # already ran the centre point
+        if (dcw, dbw) != (0, 0)
     ]
-    fine_grid = list(set(fine_grid))  # deduplicate
+    fine_grid = list(set(fine_grid))
 
     print("    Weight search: fine grid...")
-    fine_results = list(coarse_results)  # include coarse results so centre isn't lost
+    fine_results = list(coarse_results)
     for cw, bw in fine_grid:
         lbl = optimise(labels_init.copy(), gdf, adj, n, compact_wt=cw, balance_wt=bw)
         cs, bs = score_labels(lbl, gdf, adj, n)
         fine_results.append((cw, bw, cs, bs, lbl))
-        print(f"      CW={cw:.1f} BW={bw:.1f}  →  compactness={cs:,.0f}m  balance={bs:.4f}")
+        print(f"      CW={cw:.1f} BW={bw:.1f} -> compactness={cs:,.0f}m  balance={bs:.4f}")
 
-    # re-normalise over all results and pick winner
     all_cs = [r[2] for r in fine_results]
     all_bs = [r[3] for r in fine_results]
     cs_min, cs_max = min(all_cs), max(all_cs)
@@ -362,8 +339,8 @@ def find_optimal_weights(gdf, adj, n, labels_init):
 def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
     labels = labels.copy()
     population = gdf["population"].values
-    ideal      = population.sum() / n
-    centroids  = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
+    ideal = population.sum() / n
+    centroids = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
 
     def district_centroid(d):
         members = np.where(labels == d)[0]
@@ -378,7 +355,7 @@ def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
     typical_dev  = (population.sum() / n) ** 2
 
     improved = True
-    passes   = 0
+    passes = 0
     while improved and passes < 50:
         improved = False
         passes  += 1
@@ -393,21 +370,21 @@ def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
             if not is_contiguous_after_removal(i, current, labels, adj):
                 continue
 
-            current_pop     = population[labels == current].sum()
-            cur_centre      = district_centroid(current)
+            current_pop = population[labels == current].sum()
+            cur_centre = district_centroid(current)
             dist_to_current = np.linalg.norm(centroids[i] - cur_centre)
-            best_score      = 0.0
-            best_target     = None
+            best_score = 0.0
+            best_target = None
 
             for target in neighbor_districts:
-                target_pop     = population[labels == target].sum()
-                tgt_centre     = district_centroid(target)
+                target_pop = population[labels == target].sum()
+                tgt_centre = district_centroid(target)
                 dist_to_target = np.linalg.norm(centroids[i] - tgt_centre)
 
                 compact_score = (dist_to_current - dist_to_target) / typical_dist
 
-                before        = (current_pop - ideal)**2 + (target_pop - ideal)**2
-                after         = ((current_pop - population[i]) - ideal)**2 + \
+                before = (current_pop - ideal)**2 + (target_pop - ideal)**2
+                after = ((current_pop - population[i]) - ideal)**2 + \
                                 ((target_pop  + population[i]) - ideal)**2
                 balance_score = (before - after) / typical_dev
 
@@ -418,13 +395,13 @@ def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
 
             if best_target is not None:
                 labels[i] = best_target
-                improved   = True
+                improved = True
 
         labels = fix_all_contiguity(labels, adj, n)
 
     return labels
 
-# VISUALISATION :D (for now just the redistricted map) ======
+# VISUALISATION :D (for now just the redistricted map)
 
 # this is just a function to plot the state with the new districts (after optimising)
 # this is pretty self explainatory so im not gonna yap again
