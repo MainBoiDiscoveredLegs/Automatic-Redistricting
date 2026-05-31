@@ -206,50 +206,36 @@ def initialise(gdf, n):
     # [d1, d2, d2, d3 ...]
     # where track 0 is in d1, track 1 in d2 and so on
 
-# OPTIMISATION (blamk rn) =====
-# ── WEIGHTS (tune these) ──────────────────────────────────────────────
-# Higher COMPACT_WEIGHT  → districts look more like blobs, less population balance
-# Higher BALANCE_WEIGHT  → population more equal, districts may look jaggier
-# A good starting point is 3:1 compactness-to-balance for visual clarity
-COMPACT_WEIGHT = 3.0
-BALANCE_WEIGHT = 1.0
-# ─────────────────────────────────────────────────────────────────────
+p_balance_wt = 1.0
+contiguous_wt = 3.0
 
 def get_components(district_tracts, adj):
-    """Returns list of connected components for a set of tract indices."""
-    district_tracts = set(district_tracts)
-    visited = set()
-    components = []
+    district_tracts=set(district_tracts)
+    visited=set()
+    components=[]
     for start in district_tracts:
         if start in visited:
             continue
-        component = set()
-        queue = [start]
+        component=set()
+        queue=[start]
         while queue:
-            node = queue.pop()
+            node=queue.pop()
             if node in visited:
                 continue
             visited.add(node)
             component.add(node)
-            queue.extend(adj[node] & (district_tracts - visited))
+            queue.extend(adj[node]&(district_tracts-visited))
         components.append(component)
     return components
 
-
 def is_contiguous_after_removal(tract, district_id, labels, adj):
-    """Returns True if district_id stays connected when tract is removed."""
-    remaining = set(np.where(labels == district_id)[0]) - {tract}
+    remaining=set(np.where(labels == district_id)[0]) - {tract}
     if len(remaining) <= 1:
         return True
     return len(get_components(remaining, adj)) == 1
 
 
 def fix_all_contiguity(labels, adj, n):
-    """
-    Finds disconnected fragments within each district and absorbs them
-    into whichever neighbouring district is most common along the border.
-    Restarts from scratch after each reassignment (labels are stale after any change).
-    """
     labels = labels.copy()
     changed = True
     while changed:
@@ -259,7 +245,6 @@ def fix_all_contiguity(labels, adj, n):
             components = get_components(district_tracts, adj)
             if len(components) <= 1:
                 continue
-            # keep the biggest chunk, reassign everything else
             largest = max(components, key=len)
             for component in components:
                 if component is largest:
@@ -269,101 +254,164 @@ def fix_all_contiguity(labels, adj, n):
                     if neighbor_labels:
                         labels[tract] = max(set(neighbor_labels), key=neighbor_labels.count)
                         changed = True
-                break  # break after one fragment — restart with fresh labels
+                break
     return labels
 
+# ── WEIGHT OPTIMISATION ───────────────────────────────────────────────────────
 
-def optimise(labels, gdf, adj, n):
+def score_labels(labels, gdf, adj, n):
+    """
+    Scores a labelling on both objectives. Lower is better for both.
+    
+    compactness_score = average distance of each tract from its district's centroid
+                        (lower = more blob-like districts)
+    
+    balance_score     = coefficient of variation of district populations
+                        (lower = more equal populations, 0 = perfect)
+    """
+    population = gdf["population"].values
+    centroids  = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
+
+    # compactness: mean distance to district centroid
+    total_dist = 0.0
+    for d in range(n):
+        members = np.where(labels == d)[0]
+        if len(members) == 0:
+            continue
+        w = population[members]
+        centre = np.average(centroids[members], axis=0, weights=w)
+        total_dist += np.sum(np.linalg.norm(centroids[members] - centre, axis=1))
+    compactness_score = total_dist / len(labels)   # avg metres from centre
+
+    # balance: coefficient of variation of district populations (std/mean)
+    district_pops = np.array([population[labels == d].sum() for d in range(n)])
+    balance_score = district_pops.std() / district_pops.mean()  # 0 = perfect
+
+    return compactness_score, balance_score
+
+
+def find_optimal_weights(gdf, adj, n, labels_init):
+    """
+    Grid searches over (COMPACT_WEIGHT, BALANCE_WEIGHT) pairs and returns
+    the best combo — defined as the one with the lowest combined normalised score.
+    
+    We try a coarse grid first (fast), then zoom into the best region (fine).
+    """
+    # coarse grid — 9 combinations
+    coarse_grid = [
+        (cw, bw)
+        for cw in [1.0, 3.0, 5.0]
+        for bw in [1.0, 3.0, 5.0]
+    ]
+
+    print("    Weight search: coarse grid...")
+    coarse_results = []
+    for cw, bw in coarse_grid:
+        lbl = optimise(labels_init.copy(), gdf, adj, n, compact_wt=cw, balance_wt=bw)
+        cs, bs = score_labels(lbl, gdf, adj, n)
+        coarse_results.append((cw, bw, cs, bs, lbl))
+        print(f"      CW={cw:.1f} BW={bw:.1f}  →  compactness={cs:,.0f}m  balance={bs:.4f}")
+
+    # normalise both scores to [0,1] so they're comparable
+    all_cs = [r[2] for r in coarse_results]
+    all_bs = [r[3] for r in coarse_results]
+    cs_min, cs_max = min(all_cs), max(all_cs)
+    bs_min, bs_max = min(all_bs), max(all_bs)
+
+    def combined(cs, bs):
+        # equal weight between the two objectives when picking the winner
+        norm_cs = (cs - cs_min) / (cs_max - cs_min + 1e-9)
+        norm_bs = (bs - bs_min) / (bs_max - bs_min + 1e-9)
+        return norm_cs + norm_bs
+
+    coarse_results.sort(key=lambda r: combined(r[2], r[3]))
+    best_cw, best_bw = coarse_results[0][0], coarse_results[0][1]
+    print(f"    Best coarse: CW={best_cw} BW={best_bw}")
+
+    # fine grid — zoom in around the best coarse point
+    step = 1.0
+    fine_grid = [
+        (max(0.5, best_cw + dcw), max(0.5, best_bw + dbw))
+        for dcw in [-step, 0, step]
+        for dbw in [-step, 0, step]
+        if (dcw, dbw) != (0, 0)   # already ran the centre point
+    ]
+    fine_grid = list(set(fine_grid))  # deduplicate
+
+    print("    Weight search: fine grid...")
+    fine_results = list(coarse_results)  # include coarse results so centre isn't lost
+    for cw, bw in fine_grid:
+        lbl = optimise(labels_init.copy(), gdf, adj, n, compact_wt=cw, balance_wt=bw)
+        cs, bs = score_labels(lbl, gdf, adj, n)
+        fine_results.append((cw, bw, cs, bs, lbl))
+        print(f"      CW={cw:.1f} BW={bw:.1f}  →  compactness={cs:,.0f}m  balance={bs:.4f}")
+
+    # re-normalise over all results and pick winner
+    all_cs = [r[2] for r in fine_results]
+    all_bs = [r[3] for r in fine_results]
+    cs_min, cs_max = min(all_cs), max(all_cs)
+    bs_min, bs_max = min(all_bs), max(all_bs)
+    fine_results.sort(key=lambda r: combined(r[2], r[3]))
+
+    best_cw, best_bw, best_cs, best_bs, best_labels = fine_results[0]
+    print(f"    ✓ Optimal weights: CW={best_cw} BW={best_bw}  "
+          f"(compactness={best_cs:,.0f}m, balance={best_bs:.4f})")
+    return best_cw, best_bw, best_labels
+
+
+def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
     labels = labels.copy()
     population = gdf["population"].values
     ideal      = population.sum() / n
-
-    # precompute tract centroids once (units: metres, epsg:5070)
-    centroids = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
+    centroids  = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
 
     def district_centroid(d):
-        """Population-weighted centroid of district d."""
         members = np.where(labels == d)[0]
         w = population[members]
         return np.average(centroids[members], axis=0, weights=w)
 
-    # ── PHASE 1: fix contiguity before anything else ──────────────────
-    print("    Phase 1: fixing contiguity...")
     labels = fix_all_contiguity(labels, adj, n)
 
-    # ── PHASE 2: scored swaps ─────────────────────────────────────────
-    # Each candidate move is scored on two normalised dimensions:
-    #
-    #   compactness score  = (dist from tract to current district centre)
-    #                      - (dist from tract to target district centre)
-    #                      → positive means the tract is geographically
-    #                        closer to the target (good move)
-    #
-    #   balance score      = reduction in sum-of-squared deviation from ideal
-    #                      → positive means population becomes more equal
-    #
-    # final score = COMPACT_WEIGHT * compactness + BALANCE_WEIGHT * balance
-    # (both are normalised so the weights are meaningful and comparable)
-    #
-    # a move only happens if final score > 0
-    print("    Phase 2: scored swaps (compactness + balance)...")
-
-    # normalisation constants — computed once from the initial state
-    # compactness: typical distance between district centres
-    # balance: typical population-squared deviation
-    all_centres   = np.array([district_centroid(d) for d in range(n)])
-    typical_dist  = np.mean([np.linalg.norm(all_centres[i] - all_centres[j])
-                             for i in range(n) for j in range(i+1, n)])
-    typical_dev   = (population.sum() / n) ** 2  # roughly one ideal²
+    all_centres  = np.array([district_centroid(d) for d in range(n)])
+    typical_dist = np.mean([np.linalg.norm(all_centres[i] - all_centres[j])
+                            for i in range(n) for j in range(i+1, n)])
+    typical_dev  = (population.sum() / n) ** 2
 
     improved = True
     passes   = 0
     while improved and passes < 50:
         improved = False
         passes  += 1
-
         tract_order = list(range(len(labels)))
-        rng.shuffle(tract_order)   # random order avoids directional bias
+        rng.shuffle(tract_order)
 
         for i in tract_order:
             current = labels[i]
-
-            # only border tracts are candidates
             neighbor_districts = {labels[j] for j in adj[i] if labels[j] != current}
             if not neighbor_districts:
                 continue
-
-            # skip if this tract is an articulation point (its removal splits district)
             if not is_contiguous_after_removal(i, current, labels, adj):
                 continue
 
-            current_pop    = population[labels == current].sum()
-            cur_centre     = district_centroid(current)
+            current_pop     = population[labels == current].sum()
+            cur_centre      = district_centroid(current)
             dist_to_current = np.linalg.norm(centroids[i] - cur_centre)
-
-            best_score  = 0.0   # only accept strictly positive scores
-            best_target = None
+            best_score      = 0.0
+            best_target     = None
 
             for target in neighbor_districts:
-                target_pop = population[labels == target].sum()
-                tgt_centre = district_centroid(target)
-
-                # ── compactness component ──────────────────────────────
+                target_pop     = population[labels == target].sum()
+                tgt_centre     = district_centroid(target)
                 dist_to_target = np.linalg.norm(centroids[i] - tgt_centre)
-                # positive = tract is closer to target than to current = good
-                compact_raw = dist_to_current - dist_to_target
-                compact_score = compact_raw / typical_dist   # normalised
 
-                # ── balance component ──────────────────────────────────
-                before = (current_pop - ideal)**2 + (target_pop - ideal)**2
-                after  = ((current_pop - population[i]) - ideal)**2 + \
-                         ((target_pop  + population[i]) - ideal)**2
-                balance_raw   = before - after               # positive = better balance
-                balance_score = balance_raw / typical_dev    # normalised
+                compact_score = (dist_to_current - dist_to_target) / typical_dist
 
-                # ── combined score ─────────────────────────────────────
-                score = COMPACT_WEIGHT * compact_score + BALANCE_WEIGHT * balance_score
+                before        = (current_pop - ideal)**2 + (target_pop - ideal)**2
+                after         = ((current_pop - population[i]) - ideal)**2 + \
+                                ((target_pop  + population[i]) - ideal)**2
+                balance_score = (before - after) / typical_dev
 
+                score = compact_wt * compact_score + balance_wt * balance_score
                 if score > best_score:
                     best_score  = score
                     best_target = target
@@ -372,11 +420,10 @@ def optimise(labels, gdf, adj, n):
                 labels[i] = best_target
                 improved   = True
 
-        # repair any contiguity broken by swaps before the next pass
         labels = fix_all_contiguity(labels, adj, n)
 
-    print(f"    Done in {passes} passes.")
     return labels
+
 # VISUALISATION :D (for now just the redistricted map) ======
 
 # this is just a function to plot the state with the new districts (after optimising)
@@ -502,17 +549,19 @@ def plot_population_balance(state, gdf, labels, n):
 
 if __name__ == "__main__":
     for state, cfg in STATES.items():
-        print(f"\n{'='*50}\n{state.upper()}\n{'='*50}") # to make a cool header for each state
-        n = cfg["n_districts"] # go up to the config to understand this (very self explainatory)
+        print(f"\n{'='*50}\n{state.upper()}\n{'='*50}")
+        n = cfg["n_districts"]
 
-        gdf, adj = running(state, cfg)
-        labels = initialise(gdf, n)
-        labels = optimise(labels, gdf, adj, n)
-        plot_state(state, gdf, labels, n) # so like, after the optimisation fn is filled in the plots i made will reflect it :D
+        gdf, adj   = running(state, cfg)
+        labels_init = initialise(gdf, n)
+
+        print("  Finding optimal weights...")
+        best_cw, best_bw, labels = find_optimal_weights(gdf, adj, n, labels_init)
+        print(f"  Using CW={best_cw}, BW={best_bw} for {state}")
+
+        plot_state(state, gdf, labels, n)
         plot_vote_share(state, gdf, labels, n)
         plot_seat_comparison(state, gdf, labels, n)
         plot_population_balance(state, gdf, labels, n)
-        
 
         print(f"{state} Done.")
-
