@@ -260,7 +260,7 @@ def fix_all_contiguity(labels, adj, n):
 
 def score_labels(labels, gdf, adj, n):
     population = gdf["population"].values
-    centroids  = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
+    centroids = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
 
     total_dist = 0.0
     for d in range(n):
@@ -349,10 +349,10 @@ def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
 
     labels = fix_all_contiguity(labels, adj, n)
 
-    all_centres  = np.array([district_centroid(d) for d in range(n)])
+    all_centres = np.array([district_centroid(d) for d in range(n)])
     typical_dist = np.mean([np.linalg.norm(all_centres[i] - all_centres[j])
                             for i in range(n) for j in range(i+1, n)])
-    typical_dev  = (population.sum() / n) ** 2
+    typical_dev = (population.sum() / n) ** 2
 
     improved = True
     passes = 0
@@ -390,7 +390,7 @@ def optimise(labels, gdf, adj, n, compact_wt=3.0, balance_wt=1.0):
 
                 score = compact_wt * compact_score + balance_wt * balance_score
                 if score > best_score:
-                    best_score  = score
+                    best_score = score
                     best_target = target
 
             if best_target is not None:
