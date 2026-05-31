@@ -146,8 +146,9 @@ def build_adjacency(gdf):
     adj = defaultdict(set)
     sindex = gdf.sindex # spacial index (so we can chk tracts near the tract we're looking at)
     for i, geom in enumerate(gdf.geometry):
-        for j in sindex.intersection(geom.bounds):
-            if i != j and geom.touches(gdf.geometry[j]):
+        buffered = geom.buffer(100)  # 100 metrers buffer
+        for j in sindex.intersection(buffered.bounds):
+            if i != j and buffered.intersects(gdf.geometry[j]):
                 adj[i].add(j)
                 adj[j].add(i)
     return adj
@@ -206,67 +207,176 @@ def initialise(gdf, n):
     # where track 0 is in d1, track 1 in d2 and so on
 
 # OPTIMISATION (blamk rn) =====
-def optimise(labels, gdf, adj, n):
-    labels = labels.copy()
-    population = gdf["population"].values
-    ideal = population.sum() / n
+# ── WEIGHTS (tune these) ──────────────────────────────────────────────
+# Higher COMPACT_WEIGHT  → districts look more like blobs, less population balance
+# Higher BALANCE_WEIGHT  → population more equal, districts may look jaggier
+# A good starting point is 3:1 compactness-to-balance for visual clarity
+COMPACT_WEIGHT = 3.0
+BALANCE_WEIGHT = 1.0
+# ─────────────────────────────────────────────────────────────────────
 
-    def is_contiguous(district_tracts):
-        if len(district_tracts) <= 1:
-            return True
-        subgraph = {t: adj[t] & district_tracts for t in district_tracts}
-        visited = set()
-        queue = [next(iter(district_tracts))]
+def get_components(district_tracts, adj):
+    """Returns list of connected components for a set of tract indices."""
+    district_tracts = set(district_tracts)
+    visited = set()
+    components = []
+    for start in district_tracts:
+        if start in visited:
+            continue
+        component = set()
+        queue = [start]
         while queue:
             node = queue.pop()
             if node in visited:
                 continue
             visited.add(node)
-            queue.extend(subgraph[node] - visited)
-        return visited == district_tracts
+            component.add(node)
+            queue.extend(adj[node] & (district_tracts - visited))
+        components.append(component)
+    return components
 
-    improved = True
-    while improved:
-        improved = False
-        for i in range(len(labels)):
-            current = labels[i]
-            current_tracts = set(np.where(labels == current)[0])
-            if len(current_tracts) <= 1:
-                continue
-            for neighbor in adj[i]:
-                target = labels[neighbor]
-                if target == current:
-                    continue
-                # check contiguity of donor district after removal
-                remaining = current_tracts - {i}
-                if not is_contiguous(remaining):
-                    continue
-                # check if swap improves population balance
-                current_pop = population[labels == current].sum()
-                target_pop = population[labels == target].sum()
-                before = (current_pop - ideal)**2 + (target_pop - ideal)**2
-                after = ((current_pop - population[i]) - ideal)**2 + ((target_pop + population[i]) - ideal)**2
-                if after < before:
-                    labels[i] = target
-                    improved = True
-                    break
-    return labels
-def fix_contiguity(labels, adj):
+
+def is_contiguous_after_removal(tract, district_id, labels, adj):
+    """Returns True if district_id stays connected when tract is removed."""
+    remaining = set(np.where(labels == district_id)[0]) - {tract}
+    if len(remaining) <= 1:
+        return True
+    return len(get_components(remaining, adj)) == 1
+
+
+def fix_all_contiguity(labels, adj, n):
+    """
+    Finds disconnected fragments within each district and absorbs them
+    into whichever neighbouring district is most common along the border.
+    Restarts from scratch after each reassignment (labels are stale after any change).
+    """
     labels = labels.copy()
     changed = True
     while changed:
         changed = False
-        for i in range(len(labels)):
-            current = labels[i]
-            current_tracts = set(np.where(labels == current)[0])
-            neighbors_same = {j for j in adj[i] if labels[j] == current}
-            if len(neighbors_same) == 0 and len(current_tracts) > 1:
-                neighbor_labels = [labels[j] for j in adj[i]]
-                if neighbor_labels:
-                    labels[i] = max(set(neighbor_labels), key=neighbor_labels.count)
-                    changed = True
+        for district in range(n):
+            district_tracts = set(np.where(labels == district)[0])
+            components = get_components(district_tracts, adj)
+            if len(components) <= 1:
+                continue
+            # keep the biggest chunk, reassign everything else
+            largest = max(components, key=len)
+            for component in components:
+                if component is largest:
+                    continue
+                for tract in component:
+                    neighbor_labels = [labels[j] for j in adj[tract] if labels[j] != district]
+                    if neighbor_labels:
+                        labels[tract] = max(set(neighbor_labels), key=neighbor_labels.count)
+                        changed = True
+                break  # break after one fragment — restart with fresh labels
     return labels
 
+
+def optimise(labels, gdf, adj, n):
+    labels = labels.copy()
+    population = gdf["population"].values
+    ideal      = population.sum() / n
+
+    # precompute tract centroids once (units: metres, epsg:5070)
+    centroids = np.column_stack([gdf.geometry.centroid.x, gdf.geometry.centroid.y])
+
+    def district_centroid(d):
+        """Population-weighted centroid of district d."""
+        members = np.where(labels == d)[0]
+        w = population[members]
+        return np.average(centroids[members], axis=0, weights=w)
+
+    # ── PHASE 1: fix contiguity before anything else ──────────────────
+    print("    Phase 1: fixing contiguity...")
+    labels = fix_all_contiguity(labels, adj, n)
+
+    # ── PHASE 2: scored swaps ─────────────────────────────────────────
+    # Each candidate move is scored on two normalised dimensions:
+    #
+    #   compactness score  = (dist from tract to current district centre)
+    #                      - (dist from tract to target district centre)
+    #                      → positive means the tract is geographically
+    #                        closer to the target (good move)
+    #
+    #   balance score      = reduction in sum-of-squared deviation from ideal
+    #                      → positive means population becomes more equal
+    #
+    # final score = COMPACT_WEIGHT * compactness + BALANCE_WEIGHT * balance
+    # (both are normalised so the weights are meaningful and comparable)
+    #
+    # a move only happens if final score > 0
+    print("    Phase 2: scored swaps (compactness + balance)...")
+
+    # normalisation constants — computed once from the initial state
+    # compactness: typical distance between district centres
+    # balance: typical population-squared deviation
+    all_centres   = np.array([district_centroid(d) for d in range(n)])
+    typical_dist  = np.mean([np.linalg.norm(all_centres[i] - all_centres[j])
+                             for i in range(n) for j in range(i+1, n)])
+    typical_dev   = (population.sum() / n) ** 2  # roughly one ideal²
+
+    improved = True
+    passes   = 0
+    while improved and passes < 50:
+        improved = False
+        passes  += 1
+
+        tract_order = list(range(len(labels)))
+        rng.shuffle(tract_order)   # random order avoids directional bias
+
+        for i in tract_order:
+            current = labels[i]
+
+            # only border tracts are candidates
+            neighbor_districts = {labels[j] for j in adj[i] if labels[j] != current}
+            if not neighbor_districts:
+                continue
+
+            # skip if this tract is an articulation point (its removal splits district)
+            if not is_contiguous_after_removal(i, current, labels, adj):
+                continue
+
+            current_pop    = population[labels == current].sum()
+            cur_centre     = district_centroid(current)
+            dist_to_current = np.linalg.norm(centroids[i] - cur_centre)
+
+            best_score  = 0.0   # only accept strictly positive scores
+            best_target = None
+
+            for target in neighbor_districts:
+                target_pop = population[labels == target].sum()
+                tgt_centre = district_centroid(target)
+
+                # ── compactness component ──────────────────────────────
+                dist_to_target = np.linalg.norm(centroids[i] - tgt_centre)
+                # positive = tract is closer to target than to current = good
+                compact_raw = dist_to_current - dist_to_target
+                compact_score = compact_raw / typical_dist   # normalised
+
+                # ── balance component ──────────────────────────────────
+                before = (current_pop - ideal)**2 + (target_pop - ideal)**2
+                after  = ((current_pop - population[i]) - ideal)**2 + \
+                         ((target_pop  + population[i]) - ideal)**2
+                balance_raw   = before - after               # positive = better balance
+                balance_score = balance_raw / typical_dev    # normalised
+
+                # ── combined score ─────────────────────────────────────
+                score = COMPACT_WEIGHT * compact_score + BALANCE_WEIGHT * balance_score
+
+                if score > best_score:
+                    best_score  = score
+                    best_target = target
+
+            if best_target is not None:
+                labels[i] = best_target
+                improved   = True
+
+        # repair any contiguity broken by swaps before the next pass
+        labels = fix_all_contiguity(labels, adj, n)
+
+    print(f"    Done in {passes} passes.")
+    return labels
 # VISUALISATION :D (for now just the redistricted map) ======
 
 # this is just a function to plot the state with the new districts (after optimising)
@@ -398,7 +508,6 @@ if __name__ == "__main__":
         gdf, adj = running(state, cfg)
         labels = initialise(gdf, n)
         labels = optimise(labels, gdf, adj, n)
-        labels = fix_contiguity(labels, adj)
         plot_state(state, gdf, labels, n) # so like, after the optimisation fn is filled in the plots i made will reflect it :D
         plot_vote_share(state, gdf, labels, n)
         plot_seat_comparison(state, gdf, labels, n)
@@ -406,3 +515,4 @@ if __name__ == "__main__":
         
 
         print(f"{state} Done.")
+
