@@ -20,9 +20,9 @@ warnings.filterwarnings("ignore") # these two together just to hide a bunch of u
 # n_districts is just how many districts we wanna split the state into (can change but this is what is currently being used)
 # precinct is the patht to the shapefile for each precinct level voting results. for majkign coparision visulisations later ***IMPORTANT FOR SAMI JUAN ALYSSA***
 STATES = {
-    "Alabama":       {"fips": "01", "n_districts": 7,  "precinct": "al_2020/al_2020.shp"},
+    "Alabama": {"fips": "01", "n_districts": 7,  "precinct": "al_2020/al_2020.shp"},
     "Massachusetts": {"fips": "25", "n_districts": 9,  "precinct": "ma_2020/ma_2020.shp"},
-    "Michigan":      {"fips": "26", "n_districts": 13, "precinct": "mi_2020/mi_2020.shp"},
+    "Michigan": {"fips": "26", "n_districts": 13, "precinct": "mi_2020/mi_2020.shp"},
 }
 
 # i later found out that the population data isnt even there in the data we downloaded (big L) so gotta get it from the official api which is cooler so ayyyy
@@ -529,7 +529,7 @@ if __name__ == "__main__":
         print(f"\n{'='*50}\n{state.upper()}\n{'='*50}")
         n = cfg["n_districts"]
 
-        gdf, adj   = running(state, cfg)
+        gdf, adj = running(state, cfg)
         labels_init = initialise(gdf, n)
 
         print("  Finding optimal weights...")
